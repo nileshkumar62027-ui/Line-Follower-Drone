@@ -4,7 +4,7 @@ An autonomous line-following and landing algorithm for the **MathWorks Minidrone
 
 The drone takes off, follows a red line made of 2 to 7 straight sections (with corners from 30° to 330°), and lands softly on a red circle at the end of the track. The whole algorithm lives in **one MATLAB Function block** (`hopGuidance.m`) inside the competition model.
 
-> **Team:** `<your team name>`  |  **Event:** `MDC<Location> <Year>`  |  **MATLAB:** R2026b
+> **Team:** `<Dosapaglu>` 
 
 ---
 
@@ -188,7 +188,7 @@ Use the **MATLAB Function** block from the **Simulink** library (not the HDL Cod
 ### Stage 5: Paste the code
 
 1. Open the MATLAB Function block, delete everything inside.
-2. Paste the contents of `hopGuidance.m` and save.
+2. Paste the contents of `code` and save.
 3. Press **Ctrl+D** again.
 
 **Check:** no errors.
@@ -254,7 +254,7 @@ Repeat this check after **every** algorithm change.
 1. Open **PROJECT > Project Issues** and fix what is listed. Warnings about missing files can also appear on the untouched template; compare with a fresh copy.
 2. Make sure you added **no** Simulink models or MATLAB files inside the project subfolders. Extra files go in the main project folder. Remove code-generation output and the check model from the project.
 3. Save the Simulink model (Ctrl+S) so there is no unsaved-changes asterisk.
-4. **Share > Archive**, choose **Export Profile: Whole Project**, and name the file `<TeamName>_MDC<Location>_<Year>.mlproj` (for example `DroneSquad_MDCIndia_2026.mlproj`).
+4. **Share > Archive**, choose **Export Profile: Whole Project**, and name the file `<Dosapaglu>_MDC<India>_<2026>.mlproj` (for example `DroneSquad_MDCIndia_2026.mlproj`).
 5. The team captain submits it with **Submit your entry** on the competition page, using the registered email.
 
 ### Opening the archive on another computer
@@ -265,7 +265,7 @@ Install MATLAB R2026b with the same toolboxes and the PX4 support package, then 
 
 ## 6. Parameters you may need to change
 
-All parameters are at the top of `hopGuidance.m`.
+All parameters are at the top of `code`.
 
 | Parameter | Default | Meaning |
 |---|---|---|
