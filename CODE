@@ -1,0 +1,1029 @@
+function [xd, yd, zd, yawd, landed, dbg] = hopGuidance(img, pos, yaw)
+%#codegen
+% =========================================================================
+%  MathWorks Minidrone Competition - Round 1 (Simulation), MATLAB R2026b
+%  Perception & Guidance: Image processing and Guidance block
+%
+%  STRATEGY: survey -> fly to start end -> follow whole line -> land at end
+%
+%  How the competition guidelines are met:
+%   * Code generation : %#codegen, fixed-size arrays only, persistent state,
+%                       no toolbox calls, no dynamic memory, no strings/cells.
+%   * Track colour    : red #FF0000 detected by colour ratios (robust to light).
+%   * Track structure : 2-7 sections, 30-330 deg angles -> corner-safe
+%                       "farthest new point" following with slow-down in turns.
+%   * Sections        : starts at the START end (line end without circle) and
+%                       follows every section to the end.
+%   * Soft landing    : altitude reduced gradually (0.40 m/s, then 0.12 m/s
+%                       below 0.4 m), touchdown at 0.08 m.
+%   * Accurate landing: centres on the circle (< ~2 cm) and keeps steering to
+%                       the remembered circle centre while descending.
+%   * Time            : straight-line speed-up, short waits, efficient search.
+%
+%  States (dbg(1)):
+%   0  takeoff               7,8 calibration hops       9 back to takeoff point
+%   14 survey (climb high, find the line end with NO circle = START)
+%   15 fly to the start AT SURVEY HEIGHT (re-checks from above)
+%   17 straight down onto the start
+%   16 survey failed: come back down
+%   10 search spiral         11 lock onto the line and check where we are
+%   1  follow                3  line ended: look for the circle just past the end
+%   12 turn around           13 circle hunt (fallback)
+%   4  centre on circle      5  descend      6 landed
+%  dbg(2): 0 = start not known | 1 = turned at the circle, going to the start
+%          2 = start known, doing the full run
+%
+%  INPUTS   img : HxWx3 camera image (uint8 or float 0..1)
+%           pos : [north east down] metres (z negative = up)
+%           yaw : current yaw [rad]
+%  OUTPUTS  xd,yd,zd,yawd : setpoint [north east down yaw]
+%           landed        : true after touchdown
+%           dbg           : [state; route; altitude; mapIdx; fovw]
+% =========================================================================
+
+% ----------------------------- parameters --------------------------------
+Ts         = 0.2;    % [s]  block sample time (Timing Legend D5 = 0.2)
+hoverAlt   = 1.2;    % [m]  line-following altitude
+useSurvey  = true;   % climb high to find the start end (false for low ceilings)
+surveyAlt1 = 4.0;    % [m]  first survey height
+surveyAlt2 = 5.5;    % [m]  second survey height (if the start was not found)
+searchAlt  = 1.8;    % [m]  spiral search height (no red seen at all)
+huntAlt    = 1.5;    % [m]  last-resort circle hunt height
+climbRate  = 0.8;    % [m/s] takeoff / small climbs
+climbFast  = 1.3;    % [m/s] climb to survey height
+descHigh   = 1.1;    % [m/s] descent from survey height
+descFast   = 0.40;   % [m/s] landing descent above 0.4 m
+descSlow   = 0.12;   % [m/s] landing descent below 0.4 m (soft landing)
+landAlt    = 0.08;   % [m]  touchdown altitude
+fovw       = 0.45;   % default footprint width per metre of altitude
+yawSign    = 1;
+camOffset  = 0;
+autoCal    = true;   % false = skip calibration, use mapFixed / fovwFixed (saves ~6 s)
+mapFixed   = 0;      % mapping when autoCal = false (copy from dbg(4))
+fovwFixed  = 0.45;   % fovw when autoCal = false (copy from dbg(5))
+calDist    = 0.08;   % [m]  calibration hop length
+calMinPx   = 3;
+ds         = 4;
+hopR       = 55;     % [px] look-ahead radius
+minScorePx = 20;     % [px] red must be this far from the trail to be "new"
+clusterM   = 0.06;   % [m]  aim at ONE arm only
+followLead = 0.35;   % [m]  setpoint lead on straight line (speed)
+cornerLead = 0.07;   % [m]  setpoint lead in sharp turns (path accuracy)
+creepStep  = 0.05;   % [m]
+creepMax   = 0.25;   % [m]
+lineWpx    = 19;     % [px] line width at 1 m altitude (fallback, measured automatically)
+cLo        = 1.4;    % circle size range in line widths
+cHi        = 2.8;
+ringR      = 55;     % [px] ring used to tell "line end" from "middle / corner"
+kCenter    = 0.6;
+centTolPx  = 6;      % [px] centring tolerance before descent (~2 cm at 1.2 m)
+centMax    = 0.10;   % [m]
+landTolM   = 0.03;   % [m]  keep descending only while this close to the circle centre
+minRed     = 50;
+M          = 900;    % trail capacity
+minBlob    = 12;     % [px] ignore smaller blobs (noise)
+spStep     = 0.5;    % [m]  spiral spacing
+spMaxLeg   = 16;
+searchCarrot = 0.7;  % [m]  setpoint lead while searching / flying to the start
+carrot     = 0.30;   % [m]
+gatePx     = 40;     % [px] line must be this close to the centre while following
+% waits in seconds, converted to steps (only Ts needs changing)
+calWait     = round(2.0/Ts);
+circPersist = max(2, round(0.3/Ts));
+centSteps   = round(0.6/Ts);
+lostMax     = round(3.0/Ts);
+huntSteps   = round(4.0/Ts);
+retSteps    = round(3.0/Ts);
+creepWait   = round(0.8/Ts);
+spTimeout   = round(10/Ts);
+acqSteps    = max(3, round(0.6/Ts));
+settleSteps = max(3, round(0.6/Ts));
+goSteps     = round(20/Ts);
+% -------------------------------------------------------------------------
+
+nr = size(img,1);  nc = size(img,2);
+cx0 = (nc+1)/2;    cy0 = (nr+1)/2;
+sc = 1;
+if isfloat(img)
+    sc = 255;
+end
+pN = double(pos(1));  pE = double(pos(2));
+alt = max(-double(pos(3)), 0);
+yawIn = double(yaw);
+pos2 = [pN pE];
+dsR = ceil(nr/ds);  dsC = ceil(nc/ds);
+hR = ceil(nr/2);    hC = ceil(nc/2);
+
+persistent state altCmd init holdP yaw0 theta trail nTrail lastGood lastDir ...
+           creepDist creepT centCnt circCnt mapIdx fovwUse p0 pk Mk calT ...
+           shifts deltas lineW circC circW calSrc startKnown ignoreCirc ...
+           spC spWp spLeg spT acqCnt lostCnt blind huntT everAcq ...
+           svLvl svCnt startW nRef
+if isempty(init)
+    init = true;  state = 0;  altCmd = 0;  holdP = pos2;  yaw0 = yawIn;  theta = 0;
+    trail = zeros(M,2);  nTrail = 1;  trail(1,:) = pos2;
+    lastGood = pos2;  lastDir = [1 0];
+    creepDist = 0;  creepT = 0;  centCnt = 0;  circCnt = 0;  mapIdx = 0;
+    fovwUse = fovw;  p0 = pos2;  pk = pos2;  Mk = false(dsR,dsC);  calT = 0;
+    shifts = zeros(2,2);  deltas = zeros(2,2);  lineW = lineWpx;
+    circC = [0 0];  circW = pos2;  calSrc = 1;
+    startKnown = false;  ignoreCirc = false;
+    spC = pos2;  spWp = pos2;  spLeg = 0;  spT = 0;
+    acqCnt = 0;  lostCnt = 0;  blind = false;  huntT = 0;  everAcq = false;
+    svLvl = 1;  svCnt = 0;  startW = pos2;  nRef = 0;
+end
+
+% ------------------------- red mask and blobs ----------------------------
+Rr = double(img(:,:,1))*sc;
+Gg = double(img(:,:,2))*sc;
+Bb = double(img(:,:,3))*sc;
+mask = (Rr - max(Gg,Bb) > minRed) & (Rr*20 > 9*(Rr+Gg+Bb)) & (max(Gg,Bb)*100 < 35*Rr);
+nC = 0;  st = zeros(40,12);  L = zeros(hR,hC);
+if nnz(mask) > 0 && state ~= 7 && state ~= 8
+    [nC, st, L] = compStats(mask(1:2:end, 1:2:end), cx0, cy0, 2);
+end
+
+mpp = fovwUse*max(alt,0.2)/nc;
+mir = 1;
+if mapIdx >= 4
+    mir = -1;
+end
+thTot = theta + mod(mapIdx,4)*pi/2;
+w0 = lineW/max(alt,0.2);                    % expected line width now [px]
+
+kNear = 0;  dBest = 1e9;  nBig = 0;
+for i = 1:nC
+    if st(i,1) >= minBlob
+        nBig = nBig + 1;
+        if ~isCircBlob(st, i, w0, cLo, cHi, false) && st(i,10) < dBest
+            dBest = st(i,10);  kNear = i;
+        end
+    end
+end
+kLG = 0;
+if state == 3 || state == 13
+    [gx, gy] = w2px(pN, pE, lastGood(1), lastGood(2), mpp, mir, thTot);
+    kLG = labelNear(L, gx, gy, cx0, cy0, max(w0, 6));
+end
+
+% ------------- circle check: ONLY after the line has ended ----------------
+isC = false;  ccx = 0;  ccy = 0;
+if (state == 3 || state == 13) && nC > 0
+    [isC, ccx, ccy] = findCircle(st, nC, w0, cLo, cHi, true, kLG, minBlob);
+end
+if isC
+    circC = [ccx ccy];
+    circCnt = circCnt + 1;
+else
+    circCnt = 0;
+end
+if circCnt >= circPersist && ((state == 3 && creepDist >= creepStep) || state == 13)
+    [qN, qE] = px2w(pN, pE, circC(1), circC(2), mpp, mir, thTot);
+    ahead = (qN-lastGood(1))*lastDir(1) + (qE-lastGood(2))*lastDir(2);
+    dC = sqrt((qN-lastGood(1))^2 + (qE-lastGood(2))^2);
+    if (ahead > -0.02 && dC < 0.35) || state == 13  % circle just past the line end
+        if startKnown
+            state = 4;  centCnt = 0;  blind = false;  lostCnt = 0;  circW = [qN qE];
+        elseif ~ignoreCirc
+            ignoreCirc = true;  state = 12;  calT = 0;   % finish end first: turn around
+        end
+    end
+end
+
+% ------------------------------ state machine ----------------------------
+sp = pos2;
+landed = false;
+
+if state == 0                                       % ---- takeoff
+    altCmd = min(altCmd + climbRate*Ts, hoverAlt);
+    sp = holdP;
+    if altCmd >= hoverAlt && alt > hoverAlt - 0.08
+        yaw0 = yawIn;  theta = yawSign*yawIn + camOffset;
+        p0 = pos2;  pk = pos2;  calT = 0;
+        if kNear > 0
+            wpx = blobWidth(st, kNear);
+            if wpx > 0
+                lineW = min(max(wpx,3),40)*alt;
+            end
+        end
+        if autoCal
+            if nnz(mask(1:ds:end, 1:ds:end)) > 15
+                calSrc = 1;
+            else
+                calSrc = 2;
+            end
+            Mk = calMask(Rr, Gg, Bb, mask, ds, calSrc);
+            state = 7;
+        else
+            mapIdx = mapFixed;  fovwUse = fovwFixed;  state = 9;
+        end
+    end
+
+elseif state == 7 || state == 8                     % ---- calibration hops
+    altCmd = hoverAlt;
+    calT = calT + 1;
+    if state == 7
+        sp = pk + calDist*[1 0];
+    else
+        sp = pk + calDist*[0 1];
+    end
+    if calT >= calWait
+        Mn = calMask(Rr, Gg, Bb, mask, ds, calSrc);
+        [bdr, bdc, okm] = matchShift(Mk, Mn, 14);
+        if ~okm
+            bdr = 0;  bdc = 0;
+        end
+        kk = state - 6;
+        shifts(kk,:) = [bdr bdc];
+        deltas(kk,:) = pos2 - pk;
+        Mk = Mn;  pk = pos2;  calT = 0;
+        if state == 7
+            state = 8;
+        else
+            [bk, fnew, okc] = decideMap(shifts, deltas, theta, alt, nc, ds, calMinPx);
+            if okc
+                mapIdx = bk;  fovwUse = fnew;
+            end
+            state = 9;
+        end
+    end
+
+elseif state == 9                                   % ---- back to takeoff point, decide
+    altCmd = hoverAlt;
+    calT = calT + 1;
+    sp = p0;
+    if sqrt((pN-p0(1))^2 + (pE-p0(2))^2) < 0.03 || calT > retSteps
+        atStart = false;
+        if kNear > 0 && st(kNear,10) < 10
+            cv = anyCircle(st, nC, w0, cLo, cHi, minBlob);
+            atStart = (ringArcsAt(L, kNear, 0, 0, ringR, cx0, cy0, 120, 2) == 1) && ~cv;
+        end
+        if atStart || ~useSurvey
+            if kNear > 0
+                state = 11;  acqCnt = 0;  lostCnt = 0;
+            else
+                state = 10;  spC = pos2;  spWp = pos2;  spLeg = 0;  spT = 0;
+            end
+        else
+            state = 14;  svLvl = 1;  svCnt = 0;
+        end
+    end
+
+elseif state == 14                                  % ---- survey from high up
+    altT = surveyAlt1;
+    if svLvl == 2
+        altT = surveyAlt2;
+    end
+    altCmd = min(altCmd + climbFast*Ts, altT);
+    sp = p0;
+    if abs(alt - altT) < 0.15
+        svCnt = svCnt + 1;
+    else
+        svCnt = 0;
+    end
+    if svCnt > settleSteps
+        okS = false;  sx = 0;  sy = 0;
+        if nnz(mask) > 0
+            [nCf, stf, Lf] = compStats(mask, cx0, cy0, 1);       % full resolution
+            [okS, sx, sy] = findStart(Lf, stf, nCf, w0, cLo, cHi, minBlob, cx0, cy0, nr, nc, false);
+        end
+        if okS
+            [qN, qE] = px2w(pN, pE, sx, sy, mpp, mir, thTot);
+            startW = [qN qE];  state = 15;  calT = 0;  svCnt = 0;  nRef = 0;
+        elseif svLvl == 1
+            svLvl = 2;  svCnt = 0;
+        else
+            state = 16;
+        end
+    end
+
+elseif state == 15                                  % ---- fly to the start AT SURVEY HEIGHT
+    calT = calT + 1;
+    altT = surveyAlt1;
+    if svLvl == 2
+        altT = surveyAlt2;
+    end
+    altCmd = altT;                                  % keep the height, do not come down yet
+    sp = carrotTo(pos2, startW, searchCarrot);
+    if sqrt((pN-startW(1))^2 + (pE-startW(2))^2) < 0.05
+        svCnt = svCnt + 1;
+    else
+        svCnt = 0;
+    end
+    if svCnt > settleSteps                          % above the start: look again
+        okS = false;  sx = 0;  sy = 0;
+        if nnz(mask) > 0
+            [nCf, stf, Lf] = compStats(mask, cx0, cy0, 1);
+            [okS, sx, sy] = findStart(Lf, stf, nCf, w0, cLo, cHi, minBlob, cx0, cy0, nr, nc, true);
+        end
+        svCnt = 0;
+        if okS
+            [qN, qE] = px2w(pN, pE, sx, sy, mpp, mir, thTot);
+            nRef = nRef + 1;
+            startW = [qN qE];
+            if sqrt((qN-pN)^2 + (qE-pE)^2) <= 0.05 || nRef >= 4
+                state = 17;  calT = 0;              % right above the start: go down
+            end
+        else
+            state = 17;  calT = 0;                  % keep the first estimate
+        end
+    end
+    if calT > goSteps
+        state = 17;  calT = 0;
+    end
+
+elseif state == 17                                  % ---- straight down onto the start
+    calT = calT + 1;
+    sp = carrotTo(pos2, startW, carrot);
+    altCmd = max(altCmd - descHigh*Ts, hoverAlt);
+    if alt < hoverAlt + 0.1 || calT > goSteps
+        state = 11;  acqCnt = 0;  lostCnt = 0;
+    end
+
+elseif state == 16                                  % ---- survey failed: come down
+    sp = p0;
+    altCmd = max(altCmd - descHigh*Ts, hoverAlt);
+    if alt < hoverAlt + 0.1
+        if kNear > 0
+            state = 11;  acqCnt = 0;  lostCnt = 0;
+        else
+            state = 10;  spC = pos2;  spWp = pos2;  spLeg = 0;  spT = 0;
+        end
+    end
+
+elseif state == 10                                  % ---- search spiral
+    altCmd = min(altCmd + climbRate*Ts, searchAlt);
+    if nBig > 0
+        state = 11;  acqCnt = 0;  lostCnt = 0;
+    else
+        spT = spT + 1;
+        if sqrt((spWp(1)-pN)^2 + (spWp(2)-pE)^2) < 0.08 || spT > spTimeout
+            [spWp, spLeg] = nextLeg(spWp, spLeg, spStep, spMaxLeg, spC);
+            spT = 0;
+        end
+        sp = carrotTo(pos2, spWp, searchCarrot);
+    end
+
+elseif state == 11                                  % ---- lock onto the line, check
+    if alt > hoverAlt
+        altCmd = max(altCmd - descFast*Ts, hoverAlt);
+    else
+        altCmd = min(altCmd + climbRate*Ts, hoverAlt);
+    end
+    okT = false;  tx = 0;  ty = 0;
+    if kNear > 0
+        tx = st(kNear,11);  ty = st(kNear,12);  okT = true;
+    elseif nBig > 0
+        kb = 1;  ab = 0;
+        for i = 1:nC
+            if st(i,1) > ab
+                ab = st(i,1);  kb = i;
+            end
+        end
+        tx = st(kb,5);  ty = st(kb,6);  okT = true;
+    end
+    if okT
+        lostCnt = 0;
+        [qN, qE] = px2w(pN, pE, tx, ty, mpp, mir, thTot);
+        sp = carrotTo(pos2, [qN qE], 0.15);
+        if kNear > 0 && st(kNear,10) < 6 && abs(alt - hoverAlt) < 0.08
+            acqCnt = acqCnt + 1;
+        else
+            acqCnt = 0;
+        end
+        if acqCnt > acqSteps
+            wpx = blobWidth(st, kNear);
+            if wpx > 0
+                lineW = min(max(wpx,3),40)*alt;
+            end
+            if ~everAcq                             % where on the line are we?
+                cv = anyCircle(st, nC, w0, cLo, cHi, minBlob);
+                nArc = ringArcsAt(L, kNear, 0, 0, ringR, cx0, cy0, 120, 2);
+                if nArc == 1 && ~cv
+                    startKnown = true;   ignoreCirc = false;   % confirmed START end
+                elseif nArc == 1
+                    startKnown = false;  ignoreCirc = true;    % circle end: find start
+                else
+                    startKnown = false;  ignoreCirc = false;   % middle / corner
+                end
+                nTrail = 1;  trail(1,:) = pos2;
+                everAcq = true;
+            end
+            lastGood = pos2;  lostCnt = 0;  state = 1;
+        end
+    else
+        lostCnt = lostCnt + 1;
+        sp = pos2;
+        if lostCnt > lostMax
+            state = 10;  spT = 0;  lostCnt = 0;
+        end
+    end
+
+elseif state == 1                                   % ---- follow the line
+    altCmd = hoverAlt;
+    dT = sqrt((pN - trail(nTrail,1))^2 + (pE - trail(nTrail,2))^2);
+    if dT > 0.02 && nTrail < M
+        nTrail = nTrail + 1;
+        trail(nTrail,:) = pos2;
+    end
+    if kNear == 0 || st(kNear,10) > gatePx
+        lostCnt = lostCnt + 1;
+        sp = carrotTo(pos2, lastGood, carrot);
+        if lostCnt > lostMax
+            state = 10;  spC = lastGood;  spWp = lastGood;  spLeg = 0;  spT = 0;
+            lostCnt = 0;
+        end
+    else
+        lostCnt = 0;
+        [got, tgt] = pickTarget(L, kNear, cx0, cy0, hopR, pN, pE, mpp, mir, thTot, ...
+                                trail, nTrail, minScorePx*mpp, clusterM);
+        if got
+            v = tgt - pos2;
+            dTg = sqrt(v(1)^2 + v(2)^2);
+            dvec = v/max(dTg, 1e-6);
+            j0 = max(1, nTrail-4);
+            tv = trail(nTrail,:) - trail(j0,:);
+            tn = sqrt(tv(1)^2 + tv(2)^2);
+            cosT = 1;
+            if tn > 0.03
+                cosT = (dvec(1)*tv(1) + dvec(2)*tv(2))/tn;
+            end
+            a = min(max((cosT - 0.5)/0.45, 0), 1);   % 1 = straight, 0 = sharp turn
+            lead = cornerLead + (followLead - cornerLead)*a;
+            lead = min(lead, 1.5*dTg);                % slow down near the end
+            sp = pos2 + lead*dvec;
+            lastDir = dvec;  lastGood = pos2;
+        else
+            lastGood = pos2;  creepDist = 0;  creepT = 0;  state = 3;
+        end
+    end
+
+elseif state == 3                                   % ---- line ended: creep and look
+    altCmd = hoverAlt;
+    got = false;  tgt = pos2;
+    if kLG > 0
+        [got, tgt] = pickTarget(L, kLG, cx0, cy0, hopR, pN, pE, mpp, mir, thTot, ...
+                                trail, nTrail, minScorePx*mpp, clusterM);
+    end
+    if got                                          % it was only a corner
+        v = tgt - pos2;
+        dTg = sqrt(v(1)^2 + v(2)^2);
+        lastDir = v/max(dTg, 1e-6);
+        sp = pos2 + cornerLead*lastDir;
+        state = 1;
+    else
+        sp = lastGood + lastDir*creepDist;
+        creepT = creepT + 1;
+        dS = sqrt((pN-sp(1))^2 + (pE-sp(2))^2);
+        if dS < 0.03 || creepT > creepWait
+            creepDist = creepDist + creepStep;  creepT = 0;
+        end
+        if creepDist > creepMax                     % plain end, no circle
+            if startKnown
+                state = 13;  huntT = 0;
+            else
+                startKnown = true;  ignoreCirc = false;   % this is the START end
+                state = 12;  calT = 0;
+            end
+        end
+    end
+
+elseif state == 12                                  % ---- turn around at a line end
+    altCmd = hoverAlt;
+    calT = calT + 1;
+    sp = carrotTo(pos2, lastGood, carrot);
+    if sqrt((pN-lastGood(1))^2 + (pE-lastGood(2))^2) < 0.03 || calT > retSteps
+        nTrail = 7;
+        for j = 1:7
+            trail(j,:) = lastGood + lastDir*0.05*(j-1);
+        end
+        state = 1;
+    end
+
+elseif state == 13                                  % ---- circle hunt (fallback)
+    huntT = huntT + 1;
+    altCmd = min(altCmd + climbRate*Ts, huntAlt);
+    sp = carrotTo(pos2, lastGood + lastDir*0.12, carrot);
+    if huntT > huntSteps
+        blind = true;  circW = lastGood + lastDir*0.08;  state = 5;
+    end
+
+elseif state == 4 || state == 5                     % ---- centre / descend
+    kc = 0;  bestD = 1e9;
+    if ~blind
+        for i = 1:nC
+            if st(i,1) >= minBlob
+                dd = sqrt((st(i,5)-circC(1))^2 + (st(i,6)-circC(2))^2);
+                if dd < bestD
+                    bestD = dd;  kc = i;
+                end
+            end
+        end
+    end
+    seen = false;  inFull = false;  errpx = 0;
+    if kc > 0 && bestD < 0.25*nc
+        cx = st(kc,5);  cy = st(kc,6);
+        circC = [cx cy];
+        seen = true;
+        if st(kc,4) == 0                            % whole circle in view: trust it
+            [qN, qE] = px2w(pN, pE, cx, cy, mpp, mir, thTot);
+            circW = [qN qE];
+            errpx = sqrt(cx^2 + cy^2);
+            inFull = true;
+        end
+    end
+    stp = kCenter*(circW - pos2);
+    nn = sqrt(stp(1)^2 + stp(2)^2);
+    if nn > centMax
+        stp = stp*centMax/nn;
+    end
+    sp = pos2 + stp;
+    eW = sqrt((circW(1)-pN)^2 + (circW(2)-pE)^2);
+    if state == 4
+        if seen
+            lostCnt = 0;
+        else
+            lostCnt = lostCnt + 1;
+        end
+        if inFull && errpx < centTolPx
+            centCnt = centCnt + 1;
+        elseif inFull
+            centCnt = 0;
+        end
+        if centCnt > centSteps || lostCnt > lostMax
+            state = 5;
+        end
+    else
+        if eW < landTolM || alt < 0.25
+            if alt > 0.4
+                altCmd = max(altCmd - descFast*Ts, 0);
+            else
+                altCmd = max(altCmd - descSlow*Ts, 0);
+            end
+        end
+        if alt < landAlt && altCmd <= 0
+            state = 6;
+        end
+    end
+end
+
+if state == 6
+    landed = true;  altCmd = 0;  sp = pos2;
+end
+
+xd = sp(1);  yd = sp(2);  zd = -altCmd;
+yawd = atan2(sin(yaw0), cos(yaw0));
+route = 0;
+if startKnown
+    route = 2;
+elseif ignoreCirc
+    route = 1;
+end
+dbg = [double(state); route; alt; double(mapIdx); fovwUse];
+end
+
+% ========================================================================
+function [qN, qE] = px2w(pN, pE, x, y, mpp, mir, th)
+% image offset (x right, y up, px) -> ground point [north east]
+fwd = y*mpp;  rgt = mir*x*mpp;
+qN = pN + fwd*cos(th) - rgt*sin(th);
+qE = pE + fwd*sin(th) + rgt*cos(th);
+end
+
+% ------------------------------------------------------------------------
+function [x, y] = w2px(pN, pE, qN, qE, mpp, mir, th)
+% ground point -> image offset (x right, y up, px)
+dN = qN - pN;  dE = qE - pE;
+fwd = dN*cos(th) + dE*sin(th);
+rgt = -dN*sin(th) + dE*cos(th);
+x = mir*rgt/mpp;  y = fwd/mpp;
+end
+
+% ------------------------------------------------------------------------
+function sp = carrotTo(p, t, dmax)
+v = t - p;
+d = sqrt(v(1)^2 + v(2)^2);
+if d > dmax
+    v = v*dmax/d;
+end
+sp = p + v;
+end
+
+% ------------------------------------------------------------------------
+function [wp2, leg2] = nextLeg(wp, leg, stepL, maxLeg, c)
+% expanding square spiral: N, E, S, W with lengths 1,1,2,2,3,3,... x stepL
+d = mod(leg, 4);
+len = stepL*(floor(leg/2) + 1);
+v = [1 0];
+if d == 1
+    v = [0 1];
+elseif d == 2
+    v = [-1 0];
+elseif d == 3
+    v = [0 -1];
+end
+wp2 = wp + len*v;
+leg2 = leg + 1;
+if leg2 > maxLeg
+    leg2 = 0;  wp2 = c;
+end
+end
+
+% ------------------------------------------------------------------------
+function Mm = calMask(Rr, Gg, Bb, mask, ds, src)
+% binary image used to measure the calibration shift
+if src == 1
+    Mm = mask(1:ds:end, 1:ds:end);
+else
+    g = (Rr(1:ds:end,1:ds:end) + Gg(1:ds:end,1:ds:end) + Bb(1:ds:end,1:ds:end))/3;
+    Mm = g > mean(g(:));
+end
+end
+
+% ------------------------------------------------------------------------
+function [nComp, st, L] = compStats(m, cx0, cy0, sf)
+% blobs of mask m (sf = 2: half-resolution mask, sf = 1: full resolution)
+% st: 1 area px, 2 width px, 3 height px, 4 touches border, 5-6 centroid (x right, y up),
+%     7-9 covariance px^2, 10 nearest distance to centre, 11-12 nearest pixel (x, y)
+H = size(m,1);  W = size(m,2);
+maxK = 40;
+st = zeros(maxK,12);
+L = zeros(H,W);
+stk = zeros(H*W,1);
+nComp = 0;
+for r0 = 1:H
+    for c0 = 1:W
+        if m(r0,c0) && L(r0,c0) == 0 && nComp < maxK
+            nComp = nComp + 1;
+            top = 1;  stk(1) = (c0-1)*H + r0;  L(r0,c0) = nComp;
+            a = 0;  rmin = r0;  rmax = r0;  cmin = c0;  cmax = c0;
+            sr = 0;  scol = 0;  srr = 0;  scc = 0;  src = 0;  touch = 0;
+            dmin = 1e18;  nx = 0;  ny = 0;
+            while top > 0
+                idx = stk(top);  top = top - 1;
+                c = floor((idx-1)/H) + 1;  r = idx - (c-1)*H;
+                a = a + 1;  sr = sr + r;  scol = scol + c;
+                srr = srr + r*r;  scc = scc + c*c;  src = src + r*c;
+                rmin = min(rmin,r);  rmax = max(rmax,r);
+                cmin = min(cmin,c);  cmax = max(cmax,c);
+                if r == 1 || r == H || c == 1 || c == W
+                    touch = 1;
+                end
+                dx = (sf*(c-1)+1) - cx0;  dy = cy0 - (sf*(r-1)+1);
+                dd = dx*dx + dy*dy;
+                if dd < dmin
+                    dmin = dd;  nx = dx;  ny = dy;
+                end
+                if r > 1 && m(r-1,c) && L(r-1,c) == 0
+                    L(r-1,c) = nComp;  top = top + 1;  stk(top) = (c-1)*H + (r-1);
+                end
+                if r < H && m(r+1,c) && L(r+1,c) == 0
+                    L(r+1,c) = nComp;  top = top + 1;  stk(top) = (c-1)*H + (r+1);
+                end
+                if c > 1 && m(r,c-1) && L(r,c-1) == 0
+                    L(r,c-1) = nComp;  top = top + 1;  stk(top) = (c-2)*H + r;
+                end
+                if c < W && m(r,c+1) && L(r,c+1) == 0
+                    L(r,c+1) = nComp;  top = top + 1;  stk(top) = c*H + r;
+                end
+            end
+            mr = sr/a;  mc = scol/a;
+            st(nComp,:) = [a*sf*sf, (cmax-cmin+1)*sf, (rmax-rmin+1)*sf, touch, ...
+                           (sf*(mc-1)+1)-cx0, cy0-(sf*(mr-1)+1), ...
+                           (scc/a-mc^2)*sf*sf, (srr/a-mr^2)*sf*sf, (src/a-mr*mc)*sf*sf, ...
+                           sqrt(dmin), nx, ny];
+        end
+    end
+end
+end
+
+% ------------------------------------------------------------------------
+function ok = isCircBlob(st, i, w0, cLo, cHi, loose)
+% isolated, round, compact blob of landing-circle size
+lo = cLo;  hi = cHi;  rnd = 0.25;  fLo = 0.6;  fHi = 0.92;
+if loose
+    lo = 1.1;  hi = 4.0;  rnd = 0.4;  fLo = 0.5;  fHi = 0.95;
+end
+ok = false;
+if st(i,4) > 0
+    return;
+end
+wb = st(i,2);  hb = st(i,3);
+if wb < lo*w0 || wb > hi*w0 || hb < lo*w0 || hb > hi*w0
+    return;
+end
+if abs(wb-hb) > rnd*max(wb,hb)
+    return;
+end
+fill = st(i,1)/(wb*hb);
+if fill < fLo || fill > fHi
+    return;
+end
+ok = true;
+end
+
+% ------------------------------------------------------------------------
+function cv = anyCircle(st, nC, w0, cLo, cHi, minBlob)
+cv = false;
+for i = 1:nC
+    if st(i,1) >= minBlob && isCircBlob(st, i, w0, cLo, cHi, false)
+        cv = true;
+    end
+end
+end
+
+% ------------------------------------------------------------------------
+function [found, ccx, ccy] = findCircle(st, nC, w0, cLo, cHi, loose, kEx, minBlob)
+% circle blob nearest the image centre (kEx = the line's own blob, excluded)
+found = false;  ccx = 0;  ccy = 0;  bestD = 1e9;
+for i = 1:nC
+    if i ~= kEx && st(i,1) >= minBlob && isCircBlob(st, i, w0, cLo, cHi, loose)
+        if st(i,10) < bestD
+            bestD = st(i,10);  found = true;  ccx = st(i,5);  ccy = st(i,6);
+        end
+    end
+end
+end
+
+% ------------------------------------------------------------------------
+function k = labelNear(L, x, y, cx0, cy0, radPx)
+% label (half-resolution L) of the red cell nearest image point (x, y)
+H = size(L,1);  W = size(L,2);
+c0 = round(((x + cx0) + 1)/2);
+r0 = round(((cy0 - y) + 1)/2);
+rc = ceil(radPx/2);
+k = 0;  best = 1e18;
+for r = max(1, r0-rc):min(H, r0+rc)
+    for c = max(1, c0-rc):min(W, c0+rc)
+        if L(r,c) > 0
+            d = (r-r0)^2 + (c-c0)^2;
+            if d < best
+                best = d;  k = L(r,c);
+            end
+        end
+    end
+end
+end
+
+% ------------------------------------------------------------------------
+function nArc = ringArcsAt(L, k, x0, y0, R, cx0, cy0, NA, sf)
+% how many times blob k crosses a ring of radius R [px] around image point (x0,y0)
+% 1 = line END, 2 or more = middle of a line or a corner
+H = size(L,1);  W = size(L,2);
+nA = min(NA, 120);
+hit = false(120,1);
+for a = 1:nA
+    ang = 2*pi*(a-1)/nA;
+    c = round((x0 + R*cos(ang) + cx0 - 1)/sf + 1);
+    r = round((cy0 - (y0 + R*sin(ang)) - 1)/sf + 1);
+    if r >= 1 && r <= H && c >= 1 && c <= W
+        if L(r,c) == k
+            hit(a) = true;
+        end
+    end
+end
+nArc = 0;
+for a = 1:nA
+    prev = a - 1;
+    if prev < 1
+        prev = nA;
+    end
+    if hit(a) && ~hit(prev)
+        nArc = nArc + 1;
+    end
+end
+end
+
+% ------------------------------------------------------------------------
+function wpx = blobWidth(st, k)
+% width of a straight strip blob [px], 0 if the blob is not a straight strip
+xx = st(k,7);  yy = st(k,8);  xy = st(k,9);
+hm = (xx+yy)/2;  dd = sqrt(((xx-yy)/2)^2 + xy^2);
+lmin = hm - dd;  lmax = hm + dd;
+wpx = 0;
+if lmax > 8*max(lmin,1e-6) && st(k,1) > 160
+    wpx = sqrt(12*max(lmin,0));
+end
+end
+
+% ------------------------------------------------------------------------
+function [ok, sx, sy] = findStart(L, st, nC, w, cLo, cHi, minBlob, cx0, cy0, nr, nc, pickNear)
+% FULL-resolution survey image: find line ENDS; START = end with no circle next to it.
+% A point is an end only if the line crosses BOTH rings (3 and 5 line widths) once.
+% pickNear = true: choose the start end closest to the image centre (re-check from above)
+ok = false;  sx = 0;  sy = 0;
+H = size(L,1);  W = size(L,2);
+Re = 5.0*w;
+mg = Re + 2;
+mx = nc/2 - mg;  my = nr/2 - mg;
+if mx <= 0 || my <= 0
+    return;
+end
+isCb = false(40,1);
+kMain = 0;  dB = 1e9;
+for i = 1:nC
+    isCb(i) = isCircBlob(st, i, w, cLo, cHi, false);
+    if st(i,1) >= minBlob && ~isCb(i) && st(i,10) < dB
+        dB = st(i,10);  kMain = i;
+    end
+end
+maxCl = 20;
+clX = zeros(maxCl,1);  clY = zeros(maxCl,1);  clN = zeros(maxCl,1);  clK = zeros(maxCl,1);
+nCl = 0;
+for r = 1:H
+    for c = 1:W
+        k = L(r,c);
+        if k > 0
+            if st(k,1) >= minBlob && ~isCb(k)
+                x = c - cx0;  y = cy0 - r;
+                if abs(x) < mx && abs(y) < my
+                    if ringArcsAt(L, k, x, y, 0.6*Re, cx0, cy0, 64, 1) == 1
+                        if ringArcsAt(L, k, x, y, Re, cx0, cy0, 96, 1) == 1
+                            j0 = 0;
+                            for j = 1:nCl
+                                if j0 == 0 && clK(j) == k
+                                    if (clX(j)/clN(j) - x)^2 + (clY(j)/clN(j) - y)^2 < (2.5*w)^2
+                                        j0 = j;
+                                    end
+                                end
+                            end
+                            if j0 == 0 && nCl < maxCl
+                                nCl = nCl + 1;  j0 = nCl;  clK(j0) = k;
+                            end
+                            if j0 > 0
+                                clX(j0) = clX(j0) + x;  clY(j0) = clY(j0) + y;
+                                clN(j0) = clN(j0) + 1;
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+bestN = 0;  nStart = 0;  bx = 0;  by = 0;  bMain = false;  bestD = 1e18;
+for j = 1:nCl
+    if clN(j) >= 3
+        ex = clX(j)/clN(j);  ey = clY(j)/clN(j);
+        near = false;
+        for i = 1:nC
+            if i ~= clK(j) && st(i,1) >= minBlob && isCircBlob(st, i, w, cLo, cHi, true)
+                if (st(i,5)-ex)^2 + (st(i,6)-ey)^2 < (Re + 2*w)^2
+                    near = true;
+                end
+            end
+        end
+        if ~near
+            nStart = nStart + 1;
+            if pickNear
+                dd = ex*ex + ey*ey;
+                if dd < bestD
+                    bestD = dd;  bestN = clN(j);  bx = ex;  by = ey;  bMain = true;
+                end
+            else
+                onMain = (clK(j) == kMain);
+                if (onMain && ~bMain) || (onMain == bMain && clN(j) > bestN)
+                    bMain = onMain;  bestN = clN(j);  bx = ex;  by = ey;
+                end
+            end
+        end
+    end
+end
+if bestN > 0 && (bMain || nStart == 1)
+    ok = true;  sx = bx;  sy = by;
+end
+end
+
+% ------------------------------------------------------------------------
+function [got, tgt] = pickTarget(L, k, cx0, cy0, hopR, pN, pE, mpp, mir, th, ...
+                                 trail, nTrail, minScore, clusterM)
+% point of blob k (within hopR) farthest from the trail, on ONE arm only.
+% Speed-up: only trail points near the drone can be the nearest one, so the
+% far ones are skipped (same result, much less work on long tracks).
+H = size(L,1);  W = size(L,2);
+reach = 2*hopR*mpp + 0.03;                  % [m] farther trail points cannot matter
+nearN = zeros(size(trail,1),1);  nearE = zeros(size(trail,1),1);  nNear = 0;
+for j = 1:nTrail
+    if (trail(j,1)-pN)^2 + (trail(j,2)-pE)^2 <= reach*reach
+        nNear = nNear + 1;
+        nearN(nNear) = trail(j,1);  nearE(nNear) = trail(j,2);
+    end
+end
+cN = zeros(H*W,1);  cE = zeros(H*W,1);  cS = zeros(H*W,1);
+nCand = 0;  best = -1;  ib = 1;
+for r = 1:H
+    for c = 1:W
+        if L(r,c) == k
+            dx = (2*c-1) - cx0;  dy = cy0 - (2*r-1);
+            if dx*dx + dy*dy <= hopR*hopR
+                [qN, qE] = px2w(pN, pE, dx, dy, mpp, mir, th);
+                s2 = reach*reach;
+                for j = 1:nNear
+                    dd = (qN - nearN(j))^2 + (qE - nearE(j))^2;
+                    if dd < s2
+                        s2 = dd;
+                    end
+                end
+                s = sqrt(s2);
+                nCand = nCand + 1;
+                cN(nCand) = qN;  cE(nCand) = qE;  cS(nCand) = s;
+                if s > best
+                    best = s;  ib = nCand;
+                end
+            end
+        end
+    end
+end
+got = false;  tgt = [pN pE];
+if nCand > 0 && best > minScore
+    aN = 0;  aE = 0;  na = 0;
+    for i = 1:nCand
+        if cS(i) >= 0.85*best && (cN(i)-cN(ib))^2 + (cE(i)-cE(ib))^2 <= clusterM^2
+            aN = aN + cN(i);  aE = aE + cE(i);  na = na + 1;
+        end
+    end
+    tgt = [aN/na  aE/na];
+    got = true;
+end
+end
+
+% ------------------------------------------------------------------------
+function [bdr, bdc, ok] = matchShift(A, B, maxs)
+% integer shift (rows, cols) of scene content from mask A to mask B
+H = size(A,1);  W = size(A,2);
+nA = nnz(A);  nB = nnz(B);
+bdr = 0;  bdc = 0;  ok = false;  bc = 9;
+if nA + nB == 0
+    return;
+end
+for dr = -maxs:maxs
+    for dc = -maxs:maxs
+        r1a = 1 + max(0,-dr);  r2a = H - max(0,dr);
+        c1a = 1 + max(0,-dc);  c2a = W - max(0,dc);
+        r1b = 1 + max(0,dr);   r2b = H - max(0,-dr);
+        c1b = 1 + max(0,dc);   c2b = W - max(0,-dc);
+        if r2a < r1a || c2a < c1a
+            continue;
+        end
+        if (r2a-r1a+1)*(c2a-c1a+1) < 0.3*H*W
+            continue;
+        end
+        a = A(r1a:r2a, c1a:c2a);
+        b = B(r1b:r2b, c1b:c2b);
+        xo = nnz(xor(a,b));
+        lost = (nA - nnz(a)) + (nB - nnz(b));
+        c = (xo + 0.5*lost)/(nA + nB) + 1e-4*(abs(dr) + abs(dc));
+        if c < bc
+            bc = c;  bdr = dr;  bdc = dc;  ok = true;
+        end
+    end
+end
+end
+
+% ------------------------------------------------------------------------
+function [bk, fovwNew, ok] = decideMap(sh, dl, theta, alt, nc, ds, minPx)
+% choose among the 8 camera/position mappings from two test hops
+ok = false;  bk = 0;  fovwNew = 0;
+meas = zeros(2,2);
+for i = 1:2
+    meas(i,1) = sh(i,2)*ds;
+    meas(i,2) = -sh(i,1)*ds;
+    if sqrt(meas(i,1)^2 + meas(i,2)^2) < minPx
+        return;
+    end
+end
+best = -9;
+for k = 0:7
+    mir = 1;
+    if k >= 4
+        mir = -1;
+    end
+    th = theta + mod(k,4)*pi/2;
+    tot = 0;
+    for i = 1:2
+        fwdM = dl(i,1)*cos(th) + dl(i,2)*sin(th);
+        rgtM = -dl(i,1)*sin(th) + dl(i,2)*cos(th);
+        px = -rgtM*mir;
+        py = -fwdM;
+        tot = tot + (px*meas(i,1) + py*meas(i,2)) / ...
+              (sqrt(px^2+py^2)*sqrt(meas(i,1)^2+meas(i,2)^2) + 1e-12);
+    end
+    if tot > best
+        best = tot;  bk = k;
+    end
+end
+if best < 1.2
+    return;
+end
+pxm = 0;
+for i = 1:2
+    pxm = pxm + sqrt(meas(i,1)^2+meas(i,2)^2)/sqrt(dl(i,1)^2+dl(i,2)^2);
+end
+pxm = pxm/2;
+fRaw = (1/pxm)*nc/max(alt,0.2);
+if fRaw < 0.2 || fRaw > 0.9
+    return;
+end
+fovwNew = fRaw;
+ok = true;
+end
